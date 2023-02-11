@@ -1,0 +1,339 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..6559b9f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
+ endif
+ 
+ # If the makefile can't find QEMU, specify its path here
+-# QEMU = qemu-system-i386
++# QEMU = qemu-system-x86_64
+ 
+ # Try to infer the correct QEMU
+ ifndef QEMU
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_Userprog\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -249,7 +250,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
+ 
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+-	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
++	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c Drawtest.c\
+ 	printf.c umalloc.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+diff --git a/Userprog.c b/Userprog.c
+new file mode 100644
+index 0000000..7d6fabd
+--- /dev/null
++++ b/Userprog.c
+@@ -0,0 +1,13 @@
++#include "types.h"
++#include "user.h"
++
++int main(void)
++{
++	long long int sum = 0;
++
++	for(long long i = 0; i < (long long) 1e9; i++){
++		sum += i;
++	}
++	sleep(5);
++	exit();
++}
+diff --git a/defs.h b/defs.h
+index 82fb982..3649a58 100644
+--- a/defs.h
++++ b/defs.h
+@@ -120,6 +120,7 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int             waitstats(int*, int*, int *);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/proc.c b/proc.c
+index 806b1b1..2fb2223 100644
+--- a/proc.c
++++ b/proc.c
+@@ -88,6 +88,10 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->ctime = ticks;
++  p->retime = 0;
++  p->rutime = 0;
++  p->stime = 0;
+ 
+   release(&ptable.lock);
+ 
+@@ -311,6 +315,50 @@ wait(void)
+   }
+ }
+ 
++int waitstats(int *retime, int *rutime, int *stime) {
++  struct proc *p; // child process
++  int havekids, pid;
++  struct proc* curproc = myproc(); // parent process
++  acquire(&ptable.lock);
++  for(;;){
++    // find zombie children.
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != curproc)
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE) { // child is zombie
++      // reset child and remove it from ptable
++        *retime = p->retime;
++        *rutime = p->rutime;
++        *stime = p->stime;
++        pid = p->pid;
++        kfree(p->kstack);
++        p->kstack = 0;
++        freevm(p->pgdir);
++        p->state = UNUSED;
++        p->pid = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->killed = 0;
++        p->ctime = 0;
++        p->retime = 0;
++        p->rutime = 0;
++        p->stime = 0;
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++    // Failed to find children.
++    if(!havekids || curproc->killed) {
++      release(&ptable.lock);
++      return -1;
++    }
++    // Wait for children to exit.
++    sleep(curproc, &ptable.lock);
++  }
++}
++
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+@@ -532,3 +580,25 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++// triggered on every clock tick to update the statistics for each process
++void updatestats() {
++  struct proc *p;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    switch(p->state) {
++      case SLEEPING:
++        p->stime++;
++        break;
++      case RUNNABLE:
++        p->retime++;
++        break;
++      case RUNNING:
++        p->rutime++;
++        break;
++      default:
++        ;
++    }
++  }
++  release(&ptable.lock);
++}
+diff --git a/proc.h b/proc.h
+index 1647114..9c67db6 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,10 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  uint ctime;                   // Process creation time
++  int stime;                   //process SLEEPING time
++  int retime;                  //process READY(RUNNABLE) time
++  int rutime;                  //process RUNNING time
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+@@ -56,3 +60,5 @@ struct proc {
+ //   original data and bss
+ //   fixed-size stack
+ //   expandable heap
++
++void updatestats();
+diff --git a/sh.c b/sh.c
+index 054bab9..aa73db3 100644
+--- a/sh.c
++++ b/sh.c
+@@ -12,6 +12,7 @@
+ #define BACK  5
+ 
+ #define MAXARGS 10
++#define INPUT_BUF 128
+ 
+ struct cmd {
+   int type;
+@@ -144,9 +145,9 @@ getcmd(char *buf, int nbuf)
+ int
+ main(void)
+ {
+-  static char buf[100];
++  static char buf[INPUT_BUF];
+   int fd;
+-
++  int retime, rutime, stime, pid;
+   // Ensure that three file descriptors are open.
+   while((fd = open("console", O_RDWR)) >= 0){
+     if(fd >= 3){
+@@ -164,9 +165,15 @@ main(void)
+         printf(2, "cannot cd %s\n", buf+3);
+       continue;
+     }
+-    if(fork1() == 0)
++    if(fork1() == 0) {
++      // in child process (newly created)
+       runcmd(parsecmd(buf));
+-    wait();
++    }
++    else {
++      // wait();
++      pid = wait2(&retime, &rutime, &stime); // system call
++      printf(1, "pid:%d retime:%d rutime:%d stime:%d\n", pid, retime, rutime, stime);
++    }
+   }
+   exit();
+ }
+diff --git a/syscall.c b/syscall.c
+index ee85261..727f23e 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,7 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_wait2(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_wait2]   sys_wait2,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..e7342a2 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_wait2  23
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..e77d023 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -26,6 +26,17 @@ sys_wait(void)
+   return wait();
+ }
+ 
++int sys_wait2(void) {
++  int *retime, *rutime, *stime;
++  if (argptr(0, (void*)&retime, sizeof(retime)) < 0)
++    return -1;
++  if (argptr(1, (void*)&rutime, sizeof(retime)) < 0)
++    return -1;
++  if (argptr(2, (void*)&stime, sizeof(stime)) < 0)
++    return -1;
++  return waitstats(retime, rutime, stime);
++}
++
+ int
+ sys_kill(void)
+ {
+@@ -89,3 +100,38 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++int sys_draw(void){
++char *a="                                                                88\n"  
++"                                                                88\n"  
++"                                                                88\n"  
++"88,dPYba,,adPYba,  ,adPPYYba, 8b,dPPYba, 8b       d8  ,adPPYba, 88\n"  
++"88P     88      8a         Y8 88P     Y8  8b     d8  a8P_____88 88\n"  
++"88      88      88 ,adPPPPP88 88           8b   d8   8PP        88\n"  
++"88      88      88 88,    ,88 88            8b,d8     8b,   ,aa 88\n"  
++"88      88      88   8bbdPaY8 88              8         Ybbd8   88\n"; 
++// pic is the size of picture buffer
++  int pic = 0;
++  while(a[pic]!='\0'){
++      pic++;
++  }
++  char* buf;
++  int size;
++
++  if(argint(1,&size) < 0){
++    return -1;
++  }
++
++  // buffer will not be valid  
++  if(argptr(0,(char**)&buf,size) < 0){
++    return -1;
++  }
++  if(pic>size)return -1;
++  int index=0;
++  // storing picture characters in buffer
++  while(index<pic){
++    buf[index]=a[index];
++    index++;
++  }
++  // returning size of picture
++  return pic;
++}
+diff --git a/trap.c b/trap.c
+index 41c66eb..a911664 100644
+--- a/trap.c
++++ b/trap.c
+@@ -51,6 +51,7 @@ trap(struct trapframe *tf)
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
++      updatestats();
+       wakeup(&ticks);
+       release(&tickslock);
+     }
+diff --git a/user.h b/user.h
+index 4f99c52..2301c46 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int wait2(int*, int*, int*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..b90c6ff 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(wait2)
